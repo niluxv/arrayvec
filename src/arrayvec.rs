@@ -513,6 +513,177 @@ impl<T, const CAP: usize> ArrayVec<T, CAP> {
         drop(g);
     }
 
+    /// Removes all but the first of consecutive elements in the vector satisfying a given equality
+    /// relation.
+    ///
+    /// The `same_bucket` function is passed references to two elements from the vector and
+    /// must determine if the elements compare equal. The elements are passed in opposite order
+    /// from their order in the slice, so if `same_bucket(a, b)` returns `true`, `a` is removed.
+    ///
+    /// If the vector is sorted, this removes all duplicates.
+    ///
+    /// # Panics
+    /// Panics if `std::mem::size_of::<Self>()` doesn't fit an `isize`.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use arrayvec::ArrayVec;
+    ///
+    /// let mut array = ArrayVec::from([1, 3, 2, 5]);
+    /// array.dedup_by(|a, b| (*a + *b) % 2 == 0);
+    ///
+    /// assert_eq!(&array[..], &[1, 2, 5]);
+    /// ```
+    pub fn dedup_by<F>(&mut self, mut same_bucket: F)
+    where
+        F: FnMut(&mut T, &mut T) -> bool
+    {
+        // SAFETY: pointer offsets need to fit an `isize` later
+        assert!(mem::size_of::<Self>() <= isize::MAX as usize);
+        // Check the implementation of
+        // https://doc.rust-lang.org/std/vec/struct.Vec.html#method.dedup_by
+        // Implementation closely mirrored here.
+        let len = self.len();
+        if len <= 1 {
+            return;
+        }
+
+        /* INVARIANT: vec.len() > read >= write > write-1 >= 0 */
+        struct FillGapOnDrop<'a, T, const CAP: usize> {
+            /* Offset of the element we want to check if it is duplicate */
+            read: usize,
+
+            /* Offset of the place where we want to place the non-duplicate
+             * when we find it. */
+            write: usize,
+
+            /* The ArrayVec that would need correction if `same_bucket` panicked */
+            vec: &'a mut ArrayVec<T, CAP>,
+        }
+
+        impl<'a, T, const CAP: usize> Drop for FillGapOnDrop<'a, T, CAP> {
+            fn drop(&mut self) {
+                /* This code gets executed when `same_bucket` panics */
+
+                /* SAFETY: invariant guarantees that `read - write`
+                 * and `len - read` never overflow and that the copy is always
+                 * in-bounds. */
+                unsafe {
+                    let ptr = self.vec.as_mut_ptr();
+                    let len = self.vec.len();
+
+                    /* How many items were left when `same_bucket` paniced.
+                     * Basically vec[read..].len() */
+                    let items_left = len.wrapping_sub(self.read);
+
+                    /* Pointer to first item in vec[write..write+items_left] slice */
+                    // SAFETY: byte size of `self.write` `T`s fits an `isize` since `vec.len()` `T`s do so
+                    let dropped_ptr = ptr.add(self.write);
+                    /* Pointer to first item in vec[read..] slice */
+                    // SAFETY: byte size of `self.read` `T`s fits an `isize` since `vec.len()` `T`s do so
+                    let valid_ptr = ptr.add(self.read);
+
+                    /* Copy `vec[read..]` to `vec[write..write+items_left]`.
+                     * The slices can overlap, so `copy_nonoverlapping` cannot be used */
+                    ptr::copy(valid_ptr, dropped_ptr, items_left);
+
+                    /* How many items have been already dropped
+                     * Basically vec[read..write].len() */
+                    let dropped = self.read.wrapping_sub(self.write);
+
+                    self.vec.set_len(len - dropped);
+                }
+            }
+        }
+
+        // SAFETY: `vec.len() > 1` so this upholds `FillGapOnDrop`s invariant
+        let mut gap = FillGapOnDrop { read: 1, write: 1, vec: self };
+        let ptr = gap.vec.as_mut_ptr();
+
+        /* Drop items while going through ArrayVec, it should be more efficient than
+         * doing slice partition_dedup + truncate */
+
+        /* SAFETY: Because of the invariant, read_ptr, prev_ptr and write_ptr
+         * are always in-bounds and read_ptr never aliases prev_ptr */
+        unsafe {
+            while gap.read < len {
+                // SAFETY: safe because pointers in-bounds and size of `self` fits in an `isize`
+                let read_ptr = ptr.add(gap.read);
+                let prev_ptr = ptr.add(gap.write.wrapping_sub(1));
+
+                if same_bucket(&mut *read_ptr, &mut *prev_ptr) {
+                    /* We have found duplicate, drop it in-place */
+                    ptr::drop_in_place(read_ptr);
+                } else {
+                    let write_ptr = ptr.add(gap.write);
+
+                    /* Because `read_ptr` can be equal to `write_ptr`, we either
+                     * have to use `copy` or conditional `copy_nonoverlapping`.
+                     * Looks like the first option is faster. */
+                    ptr::copy(read_ptr, write_ptr, 1);
+
+                    /* We have filled that place, so go further */
+                    gap.write += 1;
+                }
+
+                gap.read += 1;
+            }
+
+            /* Technically we could let `gap` clean up with its Drop, but
+             * when `same_bucket` is guaranteed to not panic, this bloats a little
+             * the codegen, so we just do it manually */
+            gap.vec.set_len(gap.write);
+            mem::forget(gap);
+        }
+    }
+
+
+    /// Removes all but the first of consecutive elements in the vector that resolve to the same
+    /// key.
+    ///
+    /// If the vector is sorted, this removes all duplicates.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use arrayvec::ArrayVec;
+    ///
+    /// let mut array = ArrayVec::from([10, 20, 21, 30, 20]);
+    /// array.dedup_by_key(|i| *i / 10);
+    ///
+    /// assert_eq!(&array[..], &[10, 20, 30, 20]);
+    /// ```
+    pub fn dedup_by_key<F, K>(&mut self, mut key: F)
+    where
+        F: FnMut(&mut T) -> K,
+        K: PartialEq,
+    {
+        self.dedup_by(|a, b| key(a) == key(b))
+    }
+
+    /// Removes consecutive repeated elements in the vector according to the
+    /// [`PartialEq`] trait implementation.
+    ///
+    /// If the vector is sorted, this removes all duplicates.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use arrayvec::ArrayVec;
+    ///
+    /// let mut array = ArrayVec::from([1, 2, 2, 3, 2]);
+    /// array.dedup();
+    ///
+    /// assert_eq!(&array[..], &[1, 2, 3, 2]);
+    /// ```
+    pub fn dedup(&mut self)
+    where
+        T: PartialEq
+    {
+        self.dedup_by(|a, b| a == b)
+    }
+
     /// Set the vector’s length without dropping or moving out elements
     ///
     /// This method is `unsafe` because it changes the notion of the
